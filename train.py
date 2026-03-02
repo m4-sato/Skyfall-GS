@@ -35,11 +35,14 @@ from PIL import Image
 from submodules.MoGe.idu_depth import MoGeIDU
 
 # pip install diffusers==0.30.1 huggingface-hub==0.33.4 transformers==4.46.3 tokenizers==0.20.3 (default)
-from submodules.FlowEdit.idu_refine import FlowEditRefineIDU 
+from submodules.FlowEdit.idu_refine import FlowEditRefineIDU
 
 # fused SSIM, for faster training
 
 from fused_ssim import fused_ssim
+
+# Weights & Biases logging
+from wandb_logger import init_wandb, log_metrics, log_flowedit_images, finish_wandb
 
 # from utils.gpu_utils import GPUManager
 
@@ -458,6 +461,16 @@ def generate_idu_training_set(
                 n_max_end=flow_edit_n_max_end,
                 n_avg=flow_edit_n_avg
             )
+
+            # Log FlowEdit refined images to wandb
+            try:
+                log_flowedit_images(
+                    images=final_imgs,
+                    captions=[f"IDU_refined_{i}_e{elevation}_r{radius}" for i in range(len(final_imgs))],
+                    step=0  # Will be updated with actual iteration in future runs
+                )
+            except Exception as e:
+                print(f"Warning: Could not log FlowEdit images to wandb: {e}")
         elif use_difix3d:
             refine_pipe = Difix3DRefineIDU(
                 save_path=refine_path,
@@ -862,12 +875,28 @@ def training_idu_episode(
                 ema_opacity_loss_for_log = 0.6 * ema_opacity_loss_for_log
             if iteration % 10 == 0:
                 progress_bar.set_postfix({
-                    "Loss": f"{ema_loss_for_log:.{7}f}", 
+                    "Loss": f"{ema_loss_for_log:.{7}f}",
                     "Depth Loss": f"{ema_depth_loss_for_log:.{7}f}",
                     "Opacity Loss": f"{ema_opacity_loss_for_log:.{7}f}",
                     "# of GS": f"{gaussians.get_xyz.shape[0]}"
                 })
                 progress_bar.update(10)
+
+                # Log training metrics to wandb
+                metrics = {
+                    "train/loss": ema_loss_for_log,
+                    "train/l1_loss": Ll1.item() if not isinstance(Ll1, float) else Ll1,
+                    "system/num_gaussians": gaussians.get_xyz.shape[0],
+                }
+                if ema_depth_loss_for_log > 0:
+                    metrics["train/depth_loss"] = ema_depth_loss_for_log
+                if ema_opacity_loss_for_log > 0:
+                    metrics["train/opacity_loss"] = ema_opacity_loss_for_log
+                if torch.cuda.is_available():
+                    metrics["system/gpu_memory_mb"] = torch.cuda.memory_allocated() / 1024**2
+
+                log_metrics(metrics, step=iteration)
+
             if iteration == opt.iterations:
                 progress_bar.close()
 
@@ -885,10 +914,19 @@ def training_idu_episode(
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     print("densification!")
+                    num_points_before = gaussians.get_xyz.shape[0]
                     size_threshold = opt.size_threshold
                     # size_threshold = None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
                     gaussians.compute_3D_filter(cameras=trainCameras + trainIDUCameras)
+                    num_points_after = gaussians.get_xyz.shape[0]
+
+                    # Log densification event to wandb
+                    log_metrics({
+                        "densify/grad_threshold": opt.densify_grad_threshold,
+                        "densify/num_points_change": num_points_after - num_points_before,
+                        "densify/num_points_total": num_points_after,
+                    }, step=iteration)
 
                 if (iteration % opt.opacity_reset_interval == 0 and iteration < opt.iterations - 100) or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
@@ -931,6 +969,57 @@ def training_idu(dataset, opt, pipe, init_checkpoint_path):
     print(f"Elevation List: {opt.idu_elevation_list}")
     print(f"FOV: {opt.idu_fov}")
     print("======================")
+
+    # Initialize Weights & Biases
+    wandb_run = init_wandb(
+        project="skyfall-gs-idu",
+        entity=None,  # Set your wandb username here if desired
+        name=f"idu-{dataset.model_path.split('/')[-1]}",
+        config={
+            # Dataset info
+            "dataset_path": dataset.source_path,
+            "dataset_type": opt.datasets_type,
+            "model_path": dataset.model_path,
+
+            # Training params
+            "iterations": opt.idu_episode_iterations,
+            "position_lr_init": opt.position_lr_init,
+            "feature_lr": opt.feature_lr,
+            "opacity_lr": opt.opacity_lr,
+            "scaling_lr": opt.scaling_lr,
+            "rotation_lr": opt.rotation_lr,
+
+            # IDU params
+            "idu_num_cams": opt.idu_num_cams,
+            "idu_train_ratio": opt.idu_train_ratio,
+            "idu_episode_iterations": opt.idu_episode_iterations,
+            "densify_grad_threshold": opt.densify_grad_threshold,
+            "idu_densify_until_iter": opt.idu_densify_until_iter,
+
+            # FlowEdit params (CRITICAL)
+            "idu_use_flow_edit": opt.idu_use_flow_edit,
+            "idu_refine": opt.idu_refine,
+            "idu_render_size": opt.idu_render_size,
+            "idu_flow_edit_n_min": opt.idu_flow_edit_n_min,
+            "idu_flow_edit_n_max": opt.idu_flow_edit_n_max,
+            "flowedit_t5_device": "cpu",  # Document the fix
+            "flowedit_transformer_quantization": "4bit",
+
+            # Loss weights
+            "lambda_depth": opt.lambda_depth,
+            "lambda_pseudo_depth": opt.lambda_pseudo_depth,
+            "lambda_opacity": opt.lambda_opacity,
+            "lambda_dssim": opt.lambda_dssim,
+
+            # System
+            "checkpoint": init_checkpoint_path,
+            "idu_radius_list": opt.idu_radius_list,
+            "idu_elevation_list": opt.idu_elevation_list,
+            "idu_fov": opt.idu_fov,
+        },
+        tags=["idu-training", "flowedit", opt.datasets_type, "12gb-vram"],
+        notes=f"IDU training with FlowEdit on {opt.datasets_type}. T5 CPU offload fix applied. Densify threshold: {opt.densify_grad_threshold}"
+    )
     # generate targets
     x = np.linspace(-opt.idu_grid_width/2, opt.idu_grid_width/2, opt.idu_grid_size+2)
     y = np.linspace(-opt.idu_grid_height/2, opt.idu_grid_height/2, opt.idu_grid_size+2)
@@ -964,7 +1053,12 @@ def training_idu(dataset, opt, pipe, init_checkpoint_path):
                 idu_num_cams=opt.idu_num_cams,
                 idu_num_samples_per_view=opt.idu_num_samples_per_view
             )
-        
+
+    # Finish W&B logging
+    print("\nIDU training complete. Finishing wandb logging...")
+    finish_wandb()
+
+    return start_checkpoint_path
 
 
 def depth_loss_func(gt_depth, depth):
@@ -1090,11 +1184,18 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
                 psnr_test /= len(config['cameras'])
-                l1_test /= len(config['cameras'])       
+                l1_test /= len(config['cameras'])
                 print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+
+                # Log evaluation metrics to wandb
+                eval_metrics = {
+                    f"eval/psnr_{config['name']}": psnr_test,
+                    f"eval/l1_{config['name']}": l1_test,
+                }
+                log_metrics(eval_metrics, step=iteration)
 
         if tb_writer:
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)

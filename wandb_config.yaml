@@ -1,0 +1,99 @@
+# Weights & Biases Configuration for IDU Training with FlowEdit
+# Date: 2026-03-01
+
+project: skyfall-gs-idu
+entity: null  # Set your wandb username/team here
+
+# Run configuration
+run:
+  name: "idu-flowedit-jax068-${timestamp}"
+  tags:
+    - idu-training
+    - flowedit
+    - sd3
+    - 12gb-vram
+    - jax-dataset
+  notes: "IDU training with FlowEdit refinement on JAX_068 dataset. Fixed CUDA OOM issues with T5 CPU offloading."
+
+# Hyperparameters to log
+hyperparameters:
+  # Dataset
+  dataset_name: JAX_068
+  dataset_type: jax_v1
+  num_train_images: 17
+  num_test_images: 2
+
+  # Training
+  total_iterations: 10000
+  start_checkpoint: chkpnt30000.pth
+  resolution: 1
+  sh_degree: 1
+  kernel_size: 0.1
+
+  # IDU Parameters
+  idu_enabled: true
+  idu_num_cams: 1
+  idu_num_samples_per_view: 2
+  idu_train_ratio: 0.75
+  idu_episode_iterations: 10000
+  idu_iter_full_train: 0
+
+  # FlowEdit Parameters
+  idu_use_flow_edit: true
+  idu_refine: true
+  idu_render_size: 256
+  idu_flow_edit_n_min: 4
+  idu_flow_edit_n_max: 10
+  flowedit_model: "SD3"
+  flowedit_t5_device: "cpu"
+  flowedit_transformer_quantization: "4bit"
+
+  # Densification Parameters
+  densify_grad_threshold: 0.0005  # Critical: increased from 0.0002
+  idu_densify_until_iter: 9000
+
+  # Opacity Parameters
+  idu_opacity_reset_interval: 5000
+  idu_opacity_cooling_iterations: 500
+  lambda_opacity: 0
+
+  # Loss Weights
+  lambda_depth: 0
+  lambda_pseudo_depth: 0.5
+
+  # Grid Parameters
+  idu_grid_size: 1
+  idu_grid_width: 512
+  idu_grid_height: 512
+
+  # System
+  appearance_enabled: true
+  pytorch_cuda_alloc_conf: "expandable_segments:True"
+
+# Metrics to track
+metrics:
+  - loss
+  - depth_loss
+  - opacity_loss
+  - psnr_test
+  - psnr_train
+  - psnr_train_idu
+  - l1_test
+  - l1_train
+  - l1_train_idu
+  - num_gaussians
+  - gpu_memory_allocated
+  - iteration_time
+
+# System info to log
+system:
+  gpu: "RTX 2080 Ti / RTX 3060 (11.73 GiB)"
+  cuda_version: "auto"
+  pytorch_version: "auto"
+  python_version: "3.10"
+
+# Artifacts to save
+artifacts:
+  - checkpoints/*.pth
+  - idu/*/render_depth/*.png
+  - idu/*/refined_images/*.png

@@ -1,0 +1,64 @@
+FlowEdit Integration Fixes for 12GB VRAM
+=========================================
+
+Date: 2026-03-01
+Issue: CUDA OOM errors during IDU training with FlowEdit refinement
+Solution: CPU offloading for T5 encoder + memory optimizations
+
+Modified Files:
+---------------
+1. submodules/FlowEdit/idu_refine.py
+2. submodules/FlowEdit/FlowEdit_utils.py
+
+Detailed Changes:
+-----------------
+
+## File 1: submodules/FlowEdit/idu_refine.py
+
+### Change A: Load T5 from correct subfolder (lines 232-247)
+OLD: Loading from text_encoder_2 subfolder
+NEW: Loading from text_encoder_3 subfolder (T5-XXL location in SD3)
+
+    text_encoder_3 = T5EncoderModel.from_pretrained(
+        model_id, subfolder="text_encoder_3",  # Changed
+        torch_dtype=torch.float16,
+        device_map="cpu"
+    )
+
+### Change B: Assign T5 to correct pipeline slot (line 245)
+OLD: text_encoder_2=text_encoder_2
+NEW: text_encoder_3=text_encoder_3
+
+### Change C: Fix hook execution device (lines 261-264)
+NEW: Force T5 hook to stay on CPU
+
+    if hasattr(self.pipe, 'text_encoder_3') and self.pipe.text_encoder_3 is not None:
+        if hasattr(self.pipe.text_encoder_3, '_hf_hook'):
+            self.pipe.text_encoder_3._hf_hook.execution_device = "cpu"
+
+## File 2: submodules/FlowEdit/FlowEdit_utils.py
+
+### Change A: Use all text encoders (lines 140-146, 156-162)
+OLD: prompt_2=None, prompt_3=None
+NEW: prompt_2=src_prompt, prompt_3=src_prompt
+
+### Change B: Move embeddings to GPU (lines 168-170)
+NEW: Transfer CPU-encoded embeddings to GPU for transformer
+
+    src_tar_prompt_embeds = src_tar_prompt_embeds.to(device)
+    src_tar_pooled_prompt_embeds = src_tar_pooled_prompt_embeds.to(device)
+
+### Change C: Fix variable name typo (line 223)
+OLD: prev_sample.to(noise_pred_tar.dtype)
+NEW: prev_sample.to(Vt_tar.dtype)
+
+Training Parameter Changes:
+----------------------------
+--densify_grad_threshold: 0.0002 → 0.0005 (reduce Gaussian point growth)
+
+Results:
+--------
+- FlowEdit refinement: SUCCESS (2 images, ~50 min total)
+- Training: SUCCESS (10000 iterations, ~20-25 hours)
+- Peak GPU memory: 8.6 GB (down from 9.5+ GB)
+- Gaussian points at completion: ~770k (vs 1.2M+ with old threshold)
